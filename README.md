@@ -12,7 +12,7 @@ An Ornstein-Uhlenbeck forward-diffusion forecaster for Roblox's Up-and-Coming to
 mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
 ```
 
-`main.py` (Python 3.13, stdlib only, no network) reads `task.json` + `history.ndjson` from `$MAKEFUN_INPUT_DIR` (default `/input`) and writes `forecast.json` to `$MAKEFUN_OUTPUT_DIR` (default `/output`). It is fully deterministic: two runs on the same history produce byte-identical output. Runtime is about half a second on the practice history.
+`main.py` (Python 3.13, stdlib only, no network) reads `task.json` + `history.ndjson` from `$MAKEFUN_INPUT_DIR` (default `/input`) and writes `forecast.json` to `$MAKEFUN_OUTPUT_DIR` (default `/output`). It is fully deterministic: two runs on the same history produce byte-identical output. Runtime is about three seconds on the practice history.
 
 ## How it works
 
@@ -21,8 +21,8 @@ mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
 - **Scoring:** the 72 hourly steps are averaged, so `p(game, place)` is the time-averaged probability the game holds that place over the window. Each place is normalised by its raw total with the newcomer share left unnamed, so the unnamed mass covers both the long tail and brand-new games entering the chart during the window (unknowable from history).
 - **Calibration** is re-estimated from the input history at every run (with fallbacks when a cell has too little data), so the same code adapts to the final history's denser hourly recorder reads.
 
-Local practice scores (own reconstruction of the practice answer from the public archive; the kit's scorer is server-only): **log score −34.09** vs the house baseline's −43.51 (typical probability per place 0.033 vs 0.013, 7.0 top-10 hits vs 6.4). See `BUILD_LOG.md` for the full design log, backtests and validation.
+Local practice scores (own reconstruction of the practice answer from the public archive; the kit's scorer is server-only): **log score −33.81** vs the house baseline's −43.51 (typical probability per place 0.034 vs 0.013, 7.3 top-10 hits vs 6.4). See `BUILD_LOG.md` for the full design log, backtests and validation.
 
 ---
 
-<sub>Entered on [make.fun](https://make.fun/bounty/roblox-up-and-coming-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=roblox-up-and-coming-forecast-01) · AI agents build software for cash rewards</sub>
+<sub>Entered on [make.fun](https://make.fun/?ref=2e4854b0&utm_source=github&utm_medium=readme&utm_campaign=roblox-up-and-coming-forecast-01) · AI agents build software for cash rewards</sub>

@@ -6,467 +6,555 @@ Reads /input/history.ndjson + /input/task.json, writes /output/forecast.json.
 Stdlib only, no network, fully deterministic (same input -> byte-identical output).
 
 Model: per-game Ornstein-Uhlenbeck forward diffusion over log-rank.
-  * Each game's rank is a distribution over log-rank bins. Every hour it
-    mean-reverts toward a common equilibrium (log-rank ~ ln 35: #1 falls fast,
-    deep ranks creep up), diffuses (rank-bucket volatility) and carries
-    momentum (recent log-rank velocity, slope ~0.21 from the history's
-    triples regression). The variance of log-rank changes saturates with lag
-    (0.094 at 6h -> 0.87 at 100h for top-20 games) and the log-rank
-    autocorrelation decays (0.97 -> 0.50), which is mean reversion, not a
-    random walk: a plain diffusion spreads far too wide over 72h.
-  * A game can fall off the chart: per-hour exit hazard by rank group x age
-    group, calibrated from the input history itself (old + deep games exit
-    fastest; top-10 young games essentially never exit).
+  * Each game's rank is a distribution over log-rank bins (0.1 wide, ranks 1-181,
+    plus an off-chart state). Every hour it mean-reverts toward a common
+    equilibrium (log-rank ~ ln 35), diffuses (rank-bucket volatility) and carries
+    momentum (recent log-rank velocity, slope ~0.21), and can leave the chart
+    (per-hour exit hazard by rank group x age group).
   * The 72 hourly steps are averaged, so p(game, place) is the time-averaged
-    probability that the game holds that place over the scored window.
-  * Games are named at a place only when their averaged probability clears the
-    cutoff (about the unnamed per-game share); everything else is left
+    probability that the game holds that place over the window.
+  * Each place is normalised by its raw total with the newcomer share left
     unnamed, so the unnamed mass covers both the long tail and brand-new games
-    that enter the chart during the window (unknowable from history).
-
-Calibration (OU rate/equilibrium, volatility, momentum, hazard, newcomer
-shares) is re-estimated from the input history at every run, with fallbacks
-from the practice-history analysis when a cell has too little data, so the
-same code adapts to the final history's denser hourly recorder reads.
+    entering the chart during the window (unknowable from history).
+  * Calibration (OU rate/equilibrium, volatility, momentum, hazard, newcomer
+    shares) is re-estimated from the input history at every run, with fallbacks
+    when a cell has too little data.
 """
 
 import json
 import math
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
-# --- tunables (defaults tuned on the practice window; see BUILD_LOG.md) ---
+# Tunables (env overrides; defaults are the calibrated values).
 CUTOFF = float(os.environ.get("FORECAST_CUTOFF", "0.003"))
-VEL_WINDOW_H = float(os.environ.get("FORECAST_VEL_WINDOW_H", "36"))
-VEL_CLIP = 0.12
-BETA_CLIP = (0.0, 0.4)
 SIGMA_MULT = float(os.environ.get("FORECAST_SIGMA_MULT", "1.0"))
-THETA_OVERRIDE = os.environ.get("FORECAST_THETA", "")
-BETA_OVERRIDE = os.environ.get("FORECAST_BETA", "")
+THETA_ENV = os.environ.get("FORECAST_THETA")
+BETA_ENV = os.environ.get("FORECAST_BETA")
+VEL_WINDOW_H = float(os.environ.get("FORECAST_VEL_WINDOW_H", "36"))
 
-# --- fallback calibration (practice history, 2026-10-30..2026-11-07) ---
-# (rank_lo, rank_hi, mu per hour, sigma per sqrt(hour))
-FALLBACK_DRIFT = [
-    (1, 1, 0.0297, 0.1302),
-    (2, 3, 0.0070, 0.1878),
-    (4, 5, -0.0026, 0.1124),
-    (6, 10, 0.0091, 0.1174),
-    (11, 20, 0.0039, 0.1010),
-    (21, 50, -0.0005, 0.0904),
-    (51, 10 ** 9, -0.0037, 0.0619),
-]
-FALLBACK_BETA = 0.213
-FALLBACK_THETA = 0.010  # per-hour mean-reversion rate
-FALLBACK_MU = 3.56  # equilibrium log-rank (~ rank 35)
-# per-hour exit hazard by (rank group, age group); age = days since created
-# (or since first seen on chart when created is unknown)
-FALLBACK_HAZARD = {
-    ("top10", "young"): 0.0005,
-    ("top10", "old"): 0.0025,
-    ("mid", "young"): 0.0005,
-    ("mid", "old"): 0.0031,
-    ("deep", "young"): 0.0117,
-    ("deep", "old"): 0.0158,
-}
-AGE_CUT_DAYS = 21.0
-
-# --- log-rank grid ---
+# Log-rank binning: 0.1-wide bins from rank 1 to rank 181, plus OFF.
 BIN_W = 0.1
-NBIN = 52  # log-rank 0 .. 5.2  (ranks 1 .. ~181)
-OFF = NBIN  # index of the off-chart state
-NSTATES = NBIN + 1
-VEL_BINS = [-0.09, -0.045, 0.0, 0.045, 0.09]
+X_MAX = math.log(181.0)
+N_BINS = int(math.ceil(X_MAX / BIN_W))  # 52
+BIN_EDGES = [i * BIN_W for i in range(N_BINS + 1)]
+BIN_CENTERS = [(i + 0.5) * BIN_W for i in range(N_BINS)]
+
+# Rank buckets for volatility / hazard (by rank).
+RANK_BUCKETS = [(1, 1), (2, 3), (4, 5), (6, 10), (11, 20), (21, 50), (51, 1000000)]
+# Fallback per-hour volatility (instantaneous sigma) per rank bucket, from the
+# practice history's diffusion estimates.
+SIGMA_FALLBACK = [0.14, 0.19, 0.11, 0.12, 0.10, 0.09, 0.06]
+# Fallback OU parameters and momentum.
+THETA_FALLBACK = 0.008
+MU_FALLBACK = math.log(35.0)
+BETA_FALLBACK = 0.213
+HAZARD_FALLBACK = 0.008  # per hour
+NEWCOMER_FALLBACK = 0.15
+
+AGE_GROUPS = [(0, 7), (7, 14), (14, 21), (21, 28), (28, 100000)]
+HAZ_RANK_GROUPS = [(1, 10), (11, 20), (21, 50), (51, 1000000)]
 
 
 def parse_time(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def rank_group(rank):
-    if rank <= 10:
-        return "top10"
-    if rank <= 50:
-        return "mid"
-    return "deep"
+def hours_between(a, b):
+    return (b - a).total_seconds() / 3600.0
 
 
-def drift_sigma_for_rank(rank, drift_table):
-    for lo, hi, mu, sig in drift_table:
+def norm_cdf(z):
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def bucket_index(rank):
+    for i, (lo, hi) in enumerate(RANK_BUCKETS):
         if lo <= rank <= hi:
-            return mu, sig
-    return drift_table[-1][2], drift_table[-1][3]
+            return i
+    return len(RANK_BUCKETS) - 1
 
 
-def norm_cdf(x):
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+def haz_rank_group(rank):
+    for i, (lo, hi) in enumerate(HAZ_RANK_GROUPS):
+        if lo <= rank <= hi:
+            return i
+    return len(HAZ_RANK_GROUPS) - 1
+
+
+def age_group(age_days):
+    for i, (lo, hi) in enumerate(AGE_GROUPS):
+        if lo <= age_days < hi:
+            return i
+    return len(AGE_GROUPS) - 1
+
+
+def ols(xs, ys):
+    """Ordinary least squares: returns (slope, intercept) or None."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 0:
+        return None
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    slope = sxy / sxx
+    return slope, my - slope * mx
 
 
 def load_history(input_dir):
-    with open(os.path.join(input_dir, "task.json"), "r", encoding="utf-8") as f:
+    with open(os.path.join(input_dir, "task.json")) as f:
         task = json.load(f)
     snaps = []
-    with open(os.path.join(input_dir, "history.ndjson"), "r", encoding="utf-8") as f:
+    with open(os.path.join(input_dir, "history.ndjson")) as f:
         for line in f:
             line = line.strip()
-            if not line:
-                continue
-            snaps.append(json.loads(line))
+            if line:
+                snaps.append(json.loads(line))
     snaps.sort(key=lambda s: s["at"])
-    # per snapshot: time, {uid: rank}, {uid: created datetime or None}
-    parsed = []
+    return task, snaps
+
+
+def game_histories(snaps):
+    """universe_id -> list of (time, rank) sorted by time."""
+    hist = {}
     for s in snaps:
         t = parse_time(s["at"])
-        ranks = {}
         for r in s.get("up_and_coming") or []:
-            ranks[int(r["universe_id"])] = int(r["rank"])
-        created = {}
-        det = s.get("details") or {}
-        if isinstance(det, dict):
-            for k, v in det.items():
-                if isinstance(v, dict) and v.get("created"):
-                    try:
-                        created[int(k)] = parse_time(v["created"])
-                    except Exception:
-                        pass
-        parsed.append((t, ranks, created))
-    return task, parsed
+            hist.setdefault(r["universe_id"], []).append((t, r["rank"]))
+    return hist
 
 
-def calibrate(snaps):
-    """Estimate OU rate/equilibrium, volatility, momentum, hazard from the history."""
-    drift_table = [list(row) for row in FALLBACK_DRIFT]
-    beta = FALLBACK_BETA
-    hazard = dict(FALLBACK_HAZARD)
-    theta = FALLBACK_THETA
-    mu_eq = FALLBACK_MU
+def game_ages(snaps, hist, close_time):
+    """universe_id -> age in days at close_time.
 
-    # --- OU rate/equilibrium: regress log-rank at t+L on log-rank at t ---
-    lag_buckets = [(4, 10), (10, 18), (18, 36), (36, 60), (60, 100)]
+    Prefer details.created (house recorder histories); fall back to the game's
+    first appearance on the chart.
+    """
+    ages = {}
+    details = {}
+    for s in reversed(snaps):
+        d = s.get("details")
+        if isinstance(d, dict) and d:
+            details = d
+            break
+    for uid, h in hist.items():
+        created = None
+        if details:
+            det = details.get(str(uid)) or details.get(uid)
+            if isinstance(det, dict) and det.get("created"):
+                try:
+                    created = parse_time(det["created"])
+                except ValueError:
+                    created = None
+        if created is not None:
+            ages[uid] = max(0.0, (close_time - created).total_seconds() / 86400.0)
+        else:
+            ages[uid] = max(0.0, (close_time - h[0][0]).total_seconds() / 86400.0)
+    return ages
+
+
+def calibrate(snaps, hist, close_time):
+    """Estimate OU rate/equilibrium, volatility, momentum, hazard and newcomer
+    shares from the history, with fallbacks when data is thin."""
+    # ---- OU theta / mu_eq: regress log-rank at lag L on log-rank now. ----
+    lag_buckets = [(6, 18), (18, 36), (36, 72), (72, 120), (120, 200)]
     thetas, mus = [], []
-    for lo, hi in lag_buckets:
-        xs, ys = [], []
-        for i, (ta, ra, _) in enumerate(snaps):
-            for (tb, rb, _) in snaps[i + 1:]:
-                lag = (tb - ta).total_seconds() / 3600.0
-                if lo <= lag < hi:
-                    for uid in set(ra) & set(rb):
-                        xs.append(math.log(ra[uid]))
-                        ys.append(math.log(rb[uid]))
-        if len(xs) >= 200:
-            mx = sum(xs) / len(xs)
-            my = sum(ys) / len(ys)
-            den = sum((x - mx) ** 2 for x in xs)
-            if den > 1e-9:
-                b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
-                a = my - b * mx
-                lag_mid = (lo + hi) / 2.0
-                if 0.05 < b < 0.99:
-                    thetas.append(-math.log(b) / lag_mid)
-                    mus.append(a / (1.0 - b))
+    for lo_h, hi_h in lag_buckets:
+        xs, ys, lags = [], [], []
+        for i, a in enumerate(snaps):
+            ta = parse_time(a["at"])
+            ma = {r["universe_id"]: r["rank"] for r in a.get("up_and_coming") or []}
+            for b in snaps[i + 1:]:
+                tb = parse_time(b["at"])
+                lag = hours_between(ta, tb)
+                if lag < lo_h:
+                    continue
+                if lag >= hi_h:
+                    break
+                mb = {r["universe_id"]: r["rank"] for r in b.get("up_and_coming") or []}
+                for u in set(ma) & set(mb):
+                    xs.append(math.log(ma[u]))
+                    ys.append(math.log(mb[u]))
+                    lags.append(lag)
+        if len(xs) < 30:
+            continue
+        fit = ols(xs, ys)
+        if fit is None:
+            continue
+        slope, intercept = fit
+        lag_mean = sum(lags) / len(lags)
+        if not (0.05 < slope < 0.999):
+            continue
+        theta_b = -math.log(slope) / lag_mean
+        if not (0.0005 < theta_b < 0.05):
+            continue
+        mu_b = intercept / (1.0 - slope)
+        if not (2.0 < mu_b < 5.0):
+            continue
+        thetas.append(theta_b)
+        mus.append(mu_b)
     if thetas:
         thetas.sort()
         mus.sort()
-        theta = max(0.003, min(0.03, thetas[len(thetas) // 2]))
-        mu_eq = max(math.log(10), min(math.log(80), mus[len(mus) // 2]))
-    if THETA_OVERRIDE:
-        theta = float(THETA_OVERRIDE)
+        theta = thetas[len(thetas) // 2]
+        mu_eq = mus[len(mus) // 2]
+    else:
+        theta, mu_eq = THETA_FALLBACK, MU_FALLBACK
+    if THETA_ENV is not None:
+        theta = float(THETA_ENV)
 
-    # --- drift & volatility per rank bucket ---
-    buckets = [(1, 1), (2, 3), (4, 5), (6, 10), (11, 20), (21, 50), (51, 10 ** 9)]
-    acc = {b: [] for b in buckets}
-    for (t0, r0, _), (t1, r1, _) in zip(snaps, snaps[1:]):
-        dt = (t1 - t0).total_seconds() / 3600.0
+    # ---- Volatility per rank bucket: mean of (dlogr^2 / dt) over pairs. ----
+    sig2 = [0.0] * len(RANK_BUCKETS)
+    cnt = [0] * len(RANK_BUCKETS)
+    for a, b in zip(snaps, snaps[1:]):
+        dt = hours_between(parse_time(a["at"]), parse_time(b["at"]))
         if dt <= 0:
             continue
-        for uid in set(r0) & set(r1):
-            dlog = math.log(r1[uid] / r0[uid])
-            for b in buckets:
-                if b[0] <= r0[uid] <= b[1]:
-                    acc[b].append((dlog, dt))
-                    break
-    for i, b in enumerate(buckets):
-        v = acc[b]
-        if len(v) >= 20:
-            mus = [d / dt for d, dt in v]
-            sigs = [d / math.sqrt(dt) for d, dt in v]
-            mu = sum(mus) / len(mus)
-            mean_s = sum(sigs) / len(sigs)
-            var_s = sum((x - mean_s) ** 2 for x in sigs) / len(sigs)
-            sigma = math.sqrt(max(var_s, 1e-6))
-            drift_table[i] = [b[0], b[1],
-                              max(-0.05, min(0.05, mu)),
-                              max(0.03, min(0.30, sigma))]
-    # --- momentum: slope of next velocity on past velocity (triples) ---
-    xs, ys = [], []
+        ma = {r["universe_id"]: r["rank"] for r in a.get("up_and_coming") or []}
+        mb = {r["universe_id"]: r["rank"] for r in b.get("up_and_coming") or []}
+        for u in set(ma) & set(mb):
+            dx = math.log(mb[u]) - math.log(ma[u])
+            bi = bucket_index(ma[u])
+            sig2[bi] += dx * dx / dt
+            cnt[bi] += 1
+    sig2_global = (
+        sum(sig2) / max(1, sum(cnt)) if sum(cnt) > 0 else 0.10 ** 2
+    )
+    sigmas = []
+    for i in range(len(RANK_BUCKETS)):
+        if cnt[i] > 0:
+            raw = sig2[i] / cnt[i]
+            # Shrink toward the global value when the bucket is thin.
+            val = (cnt[i] * raw + 20.0 * sig2_global) / (cnt[i] + 20.0)
+        else:
+            val = SIGMA_FALLBACK[i] ** 2
+        sigmas.append(max(0.02, math.sqrt(val)) * SIGMA_MULT)
+
+    # ---- Momentum beta: regress next dlogr/hr on past dlogr/hr (triples). ----
+    past, nxt = [], []
     for i in range(2, len(snaps)):
-        (ta, ra, _), (tb, rb, _), (tc, rc, _) = snaps[i - 2], snaps[i - 1], snaps[i]
-        dt1 = (tb - ta).total_seconds() / 3600.0
-        dt2 = (tc - tb).total_seconds() / 3600.0
-        if dt1 <= 0 or dt2 <= 0:
+        a, b, c = snaps[i - 2], snaps[i - 1], snaps[i]
+        ta, tb, tc = parse_time(a["at"]), parse_time(b["at"]), parse_time(c["at"])
+        dtab = hours_between(ta, tb)
+        dtbc = hours_between(tb, tc)
+        if dtab <= 0 or dtbc <= 0:
             continue
-        for uid in set(ra) & set(rb) & set(rc):
-            xs.append(math.log(rb[uid] / ra[uid]) / dt1)
-            ys.append(math.log(rc[uid] / rb[uid]) / dt2)
-    if len(xs) >= 100:
-        mx = sum(xs) / len(xs)
-        my = sum(ys) / len(ys)
-        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-        den = sum((x - mx) ** 2 for x in xs)
-        if den > 1e-9:
-            beta = max(BETA_CLIP[0], min(BETA_CLIP[1], num / den))
-    if BETA_OVERRIDE:
-        beta = float(BETA_OVERRIDE)
-    # --- exit hazard per (rank group, age group), per hour ---
-    # exposure in hours, exits counted; shrinkage toward fallback
+        ma = {r["universe_id"]: r["rank"] for r in a.get("up_and_coming") or []}
+        mb = {r["universe_id"]: r["rank"] for r in b.get("up_and_coming") or []}
+        mc = {r["universe_id"]: r["rank"] for r in c.get("up_and_coming") or []}
+        for u in set(ma) & set(mb) & set(mc):
+            past.append((math.log(mb[u]) - math.log(ma[u])) / dtab)
+            nxt.append((math.log(mc[u]) - math.log(mb[u])) / dtbc)
+    if len(past) >= 100:
+        fit = ols(past, nxt)
+        beta = fit[0] if fit is not None else BETA_FALLBACK
+    else:
+        beta = BETA_FALLBACK
+    beta = min(0.5, max(0.0, beta))
+    if BETA_ENV is not None:
+        beta = float(BETA_ENV)
+
+    # ---- Exit hazard per (rank group, age group), per hour. ----
+    ages = game_ages(snaps, hist, close_time)
+    # cell -> [exits, total, sum_dt]
     cells = {}
-    for rg in ("top10", "mid", "deep"):
-        for ag in ("young", "old"):
-            cells[(rg, ag)] = [0.0, 0]  # [exposure_hours, exits]
-    first_seen = {}
-    created_map = {}
-    for (t, ranks, created) in snaps:
-        for uid in ranks:
-            first_seen.setdefault(uid, t)
-        for uid, c in created.items():
-            created_map.setdefault(uid, c)
-    for (t0, r0, _), (t1, r1, _) in zip(snaps, snaps[1:]):
-        dt = (t1 - t0).total_seconds() / 3600.0
+    rank_tot = {}
+    glob = [0, 0, 0.0]
+    for a, b in zip(snaps, snaps[1:]):
+        dt = hours_between(parse_time(a["at"]), parse_time(b["at"]))
         if dt <= 0:
             continue
-        for uid, rk in r0.items():
-            c = created_map.get(uid)
-            if c is not None:
-                age = (t0 - c).total_seconds() / 86400.0
+        mb = {r["universe_id"] for r in b.get("up_and_coming") or []}
+        for r in a.get("up_and_coming") or []:
+            u = r["universe_id"]
+            rg = haz_rank_group(r["rank"])
+            ag = age_group(ages.get(u, 0.0))
+            key = (rg, ag)
+            cell = cells.setdefault(key, [0, 0, 0.0])
+            cell[1] += 1
+            cell[2] += dt
+            rt = rank_tot.setdefault(rg, [0, 0, 0.0])
+            rt[1] += 1
+            rt[2] += dt
+            glob[1] += 1
+            glob[2] += dt
+            if u not in mb:
+                cell[0] += 1
+                rt[0] += 1
+                glob[0] += 1
+
+    def rate_to_hourly(exits, total, sum_dt):
+        if total <= 0 or sum_dt <= 0:
+            return None
+        r = exits / total
+        if r <= 0:
+            return 0.0
+        if r >= 1:
+            return 0.05
+        return 1.0 - (1.0 - r) ** (1.0 / (sum_dt / total))
+
+    h_global = rate_to_hourly(*glob)
+    if h_global is None:
+        h_global = HAZARD_FALLBACK
+    h_rank = {}
+    for rg, (e, t, d) in rank_tot.items():
+        h = rate_to_hourly(e, t, d)
+        if h is None:
+            h = h_global
+        else:
+            h = (t * h + 10.0 * h_global) / (t + 10.0)
+        h_rank[rg] = min(0.05, h)
+    hazard = {}
+    for rg in range(len(HAZ_RANK_GROUPS)):
+        for ag in range(len(AGE_GROUPS)):
+            e, t, d = cells.get((rg, ag), [0, 0, 0.0])
+            h = rate_to_hourly(e, t, d)
+            parent = h_rank.get(rg, h_global)
+            if h is None:
+                h = parent
             else:
-                age = (t0 - first_seen[uid]).total_seconds() / 86400.0
-            ag = "young" if age < AGE_CUT_DAYS else "old"
-            cell = cells[(rank_group(rk), ag)]
-            cell[0] += dt
-            if uid not in r1:
-                cell[1] += 1
-    for key, (expo, exits) in cells.items():
-        if expo >= 50:
-            h = (exits + 0.5) / (expo + 100.0)
-            hazard[key] = max(0.0005, min(0.05, h))
-    # --- newcomer share per place: fraction of top-10 slots at lag 48-96h
-    # occupied by games not on the earlier chart (shrunk toward the global mean)
-    new_k = {k: [0, 0] for k in range(1, 11)}  # [new, total]
-    for i, (ta, ra, _) in enumerate(snaps):
-        for (tb, rb, _) in snaps[i + 1:]:
-            lag = (tb - ta).total_seconds() / 3600.0
-            if 48.0 <= lag <= 96.0:
-                for k in range(1, 11):
-                    row = sorted(rb.items(), key=lambda kv: kv[1])
-                    if len(row) >= k:
-                        uid_k = row[k - 1][0]
-                        new_k[k][1] += 1
-                        if uid_k not in ra:
-                            new_k[k][0] += 1
-    tot_new = sum(v[0] for v in new_k.values())
-    tot_n = sum(v[1] for v in new_k.values())
-    glob = (tot_new / tot_n) if tot_n else 0.15
-    newcomer = {}
-    for k in range(1, 11):
-        n_new, n_tot = new_k[k]
-        emp = (n_new / n_tot) if n_tot else glob
-        newcomer[k] = max(0.05, min(0.40, 0.3 * emp + 0.7 * glob))
-    return drift_table, beta, hazard, newcomer, theta, mu_eq
+                h = (t * h + 10.0 * parent) / (t + 10.0)
+            hazard[(rg, ag)] = min(0.05, max(0.0, h))
+
+    # ---- Newcomer shares per place, from 48-96h pairs. ----
+    newcomer = None
+    for lo_h, hi_h in ((48, 96), (24, 120)):
+        per_place = [[] for _ in range(10)]
+        for i, a in enumerate(snaps):
+            ta = parse_time(a["at"])
+            ids_a = {r["universe_id"] for r in a.get("up_and_coming") or []}
+            for b in snaps[i + 1:]:
+                lag = hours_between(ta, parse_time(b["at"]))
+                if lag < lo_h:
+                    continue
+                if lag >= hi_h:
+                    break
+                for k, r in enumerate((b.get("up_and_coming") or [])[:10]):
+                    per_place[k].append(0.0 if r["universe_id"] in ids_a else 1.0)
+        if per_place[0]:
+            raw = [
+                (sum(v) / len(v) if v else 0.0) for v in per_place
+            ]
+            glob_mean = sum(raw) / len(raw)
+            newcomer = [
+                min(0.6, max(0.0, 0.7 * r + 0.3 * glob_mean)) for r in raw
+            ]
+            break
+    if newcomer is None:
+        newcomer = [NEWCOMER_FALLBACK] * 10
+
+    return {
+        "theta": theta,
+        "mu_eq": mu_eq,
+        "sigmas": sigmas,
+        "beta": beta,
+        "hazard": hazard,
+        "newcomer": newcomer,
+        "ages": ages,
+    }
 
 
-def velocity(snaps, uid, t_end):
-    """Least-squares slope of log(rank) vs hours over the recent window."""
-    pts = []
-    for (t, ranks, _) in snaps:
-        if uid in ranks:
-            age_h = (t_end - t).total_seconds() / 3600.0
-            if age_h <= VEL_WINDOW_H:
-                pts.append((age_h, math.log(ranks[uid])))
-    if len(pts) < 2:
-        # fall back to all observations
-        pts = [( (t_end - t).total_seconds() / 3600.0, math.log(ranks[uid]))
-               for (t, ranks, _) in snaps if uid in ranks]
-    if len(pts) < 2:
+def velocity(uid, hist, close_time):
+    """Recent log-rank velocity (per hour) over the last VEL_WINDOW_H hours.
+
+    Interpolates the game's log-rank at (close_time - VEL_WINDOW_H) from the
+    two surrounding observations; falls back to the oldest observation when the
+    history is shorter than the window.
+    """
+    h = hist.get(uid)
+    if not h or len(h) < 2:
         return 0.0
-    # slope of log-rank vs time-ago (negative age_h = recent); fit vs -age_h
-    xs = [-a for a, _ in pts]
-    ys = [y for _, y in pts]
-    mx = sum(xs) / len(xs)
-    my = sum(ys) / len(ys)
-    den = sum((x - mx) ** 2 for x in xs)
-    if den < 1e-9:
+    t_close, r_close = h[-1]
+    t_target = datetime.fromtimestamp(
+        t_close.timestamp() - VEL_WINDOW_H * 3600.0, tz=timezone.utc
+    )
+    # Bracketing observations around the target time.
+    before = None
+    after = None
+    for t, r in h:
+        if t <= t_target:
+            before = (t, r)
+        if t >= t_target and after is None:
+            after = (t, r)
+    if before is not None and after is not None and after[0] > before[0]:
+        f = (t_target - before[0]).total_seconds() / (
+            after[0] - before[0]
+        ).total_seconds()
+        log_then = math.log(before[1]) + f * (
+            math.log(after[1]) - math.log(before[1])
+        )
+        dt = VEL_WINDOW_H
+    elif before is not None:
+        log_then = math.log(before[1])
+        dt = (t_close - before[0]).total_seconds() / 3600.0
+    elif after is not None:
+        log_then = math.log(after[1])
+        dt = (t_close - after[0]).total_seconds() / 3600.0
+    else:
         return 0.0
-    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
-    return max(-VEL_CLIP, min(VEL_CLIP, slope))
+    if dt <= 0:
+        return 0.0
+    return (math.log(r_close) - log_then) / dt
 
 
-def build_kernels(drift_table, beta, theta, mu_eq):
-    """K[vbin][src_bin] = [(tgt_bin, prob), ...]; OFF is index NBIN.
-    OU step: mean = center + theta*(mu_eq - center) + beta*vb, sd = bucket sigma."""
-    kernels = []
-    for vb in VEL_BINS:
-        rows = []
-        for src in range(NBIN):
-            center = (src + 0.5) * BIN_W
-            rank_c = math.exp(center)
-            _, sig = drift_sigma_for_rank(rank_c, drift_table)
-            m = center + theta * (mu_eq - center) + beta * vb
-            s = max(sig * SIGMA_MULT, 0.03)
-            row = []
-            # target bins within +-3.5 sigma
-            lo = max(0, int(math.floor((m - 3.5 * s) / BIN_W)))
-            hi = min(NBIN - 1, int(math.floor((m + 3.5 * s) / BIN_W)))
-            for tgt in range(lo, hi + 1):
-                p = norm_cdf(((tgt + 1) * BIN_W - m) / s) - norm_cdf((tgt * BIN_W - m) / s)
-                if p > 1e-7:
-                    row.append((tgt, p))
-            # mass below 0 folds into bin 0; mass above grid goes OFF
-            p_below = norm_cdf((0.0 - m) / s)
-            if p_below > 1e-7:
-                row = [(0, p_below + (row[0][1] if row and row[0][0] == 0 else 0.0))] + \
-                      [(t, p) for (t, p) in row if t != 0]
-            p_above = 1.0 - norm_cdf((NBIN * BIN_W - m) / s)
-            if p_above > 1e-7:
-                row.append((OFF, p_above))
-            # renormalise (truncation); never let a row vanish
-            tot = sum(p for _, p in row)
-            if tot > 0:
-                row = [(t, p / tot) for (t, p) in row]
-            else:
-                row = [(OFF, 1.0)]
-            rows.append(row)
-        kernels.append(rows)
-    return kernels
+# Bin -> rank-k overlap fractions, precomputed once.
+def rank_overlap():
+    """overlap[j][k] = fraction of bin j's mass at rank k (k = 0..9 for places 1..10)."""
+    ov = [[0.0] * 10 for _ in range(N_BINS)]
+    for j in range(N_BINS):
+        lo_e, hi_e = BIN_EDGES[j], BIN_EDGES[j + 1]
+        for k in range(1, 11):
+            lo_r = math.log(k - 0.5) if k > 1 else -1e9
+            hi_r = math.log(k + 0.5)
+            inter = max(0.0, min(hi_e, hi_r) - max(lo_e, lo_r))
+            ov[j][k - 1] = inter / BIN_W
+    return ov
 
 
-def rank_weights():
-    """W[k][bin] = overlap of bin with [ln(k-0.5), ln(k+0.5)) for k=1..10."""
-    W = {}
-    for k in range(1, 11):
-        lo = math.log(k - 0.5)
-        hi = math.log(k + 0.5)
-        w = []
-        for b in range(NBIN):
-            blo, bhi = b * BIN_W, (b + 1) * BIN_W
-            ov = max(0.0, min(bhi, hi) - max(blo, lo))
-            w.append(ov / BIN_W if ov > 0 else 0.0)
-        W[k] = w
-    return W
+OVERLAP = rank_overlap()
+
+
+def forward(uid, rank0, vel, age_days, params, steps):
+    """Run one game's OU diffusion for `steps` hours.
+
+    Returns (q, total_top10) where q[k] is the time-averaged probability of
+    holding place k+1 (k = 0..9) and total_top10 is the summed top-10 mass.
+    """
+    theta = params["theta"]
+    mu_eq = params["mu_eq"]
+    beta = params["beta"]
+    sigmas = params["sigmas"]
+    hazard = params["hazard"]
+    ag = age_group(age_days)
+
+    # Initial distribution: point mass in the bin holding ln(rank0).
+    dist = [0.0] * N_BINS
+    x0 = math.log(max(1, rank0))
+    i0 = min(N_BINS - 1, max(0, int(x0 / BIN_W)))
+    dist[i0] = 1.0
+    off = 0.0
+
+    acc = [0.0] * 10
+    for _ in range(steps):
+        new = [0.0] * N_BINS
+        new_off = off
+        for i, m in enumerate(dist):
+            if m <= 1e-12:
+                continue
+            x = BIN_CENTERS[i]
+            mean = x + theta * (mu_eq - x) + beta * vel
+            sd = sigmas[bucket_index(max(1, int(round(math.exp(x)))))]
+            if sd <= 1e-9:
+                j = min(N_BINS - 1, max(0, int(mean / BIN_W)))
+                new[j] += m
+                continue
+            lo_j = max(0, int((mean - 4.0 * sd) / BIN_W))
+            hi_j = min(N_BINS - 1, int((mean + 4.0 * sd) / BIN_W))
+            # CDF at the edges of the covered bins.
+            for j in range(lo_j, hi_j + 1):
+                w = norm_cdf((BIN_EDGES[j + 1] - mean) / sd) - norm_cdf(
+                    (BIN_EDGES[j] - mean) / sd
+                )
+                if w > 0:
+                    new[j] += m * w
+            # Mass below rank 1 folds into bin 0; mass past the top folds OFF.
+            below = norm_cdf((BIN_EDGES[0] - mean) / sd)
+            if below > 0:
+                new[0] += m * below
+            above = 1.0 - norm_cdf((BIN_EDGES[N_BINS] - mean) / sd)
+            if above > 0:
+                new_off += m * above
+        # Exit hazard: mass leaves the chart from each bin by rank group.
+        kept = [0.0] * N_BINS
+        for j, m in enumerate(new):
+            if m <= 0:
+                continue
+            rank_j = max(1, int(round(math.exp(BIN_CENTERS[j]))))
+            h = hazard.get((haz_rank_group(rank_j), ag), HAZARD_FALLBACK)
+            kept[j] = m * (1.0 - h)
+            new_off += m * h
+        dist = kept
+        off = new_off
+        for k in range(10):
+            s = 0.0
+            for j, m in enumerate(dist):
+                if m > 0 and OVERLAP[j][k] > 0:
+                    s += m * OVERLAP[j][k]
+            acc[k] += s
+    q = [a / steps for a in acc]
+    return q, sum(q)
 
 
 def main():
     task, snaps = load_history(INPUT_DIR)
     places = int(task.get("places", 10))
-    n_slots = int(task.get("window", {}).get("slots", 72))
-    out_name = task.get("output", "forecast.json")
+    steps = int(task.get("window", {}).get("slots", 72))
+    output_name = task.get("output", "forecast.json")
+    if not snaps:
+        raise SystemExit("no snapshots in history")
+    hist = game_histories(snaps)
+    close_time = parse_time(snaps[-1]["at"])
+    close_chart = sorted(
+        snaps[-1].get("up_and_coming") or [], key=lambda r: r["rank"]
+    )
+    close_rank = {r["universe_id"]: r["rank"] for r in close_chart}
+    params = calibrate(snaps, hist, close_time)
 
-    t_end, close_ranks, close_created = snaps[-1]
-    drift_table, beta, hazard, newcomer, theta, mu_eq = calibrate(snaps)
-    kernels = build_kernels(drift_table, beta, theta, mu_eq)
-    W = rank_weights()
+    # Forward-simulate every game on the close chart (sorted for determinism).
+    results = {}
+    for uid in sorted(close_rank):
+        vel = velocity(uid, hist, close_time)
+        q, tot = forward(
+            uid, close_rank[uid], vel, params["ages"].get(uid, 0.0),
+            params, steps,
+        )
+        results[uid] = (q, tot)
 
-    # first-seen + created per game (for age in hazard)
-    first_seen = {}
-    created_map = {}
-    for (t, ranks, created) in snaps:
-        for uid in ranks:
-            first_seen.setdefault(uid, t)
-        for uid, c in created.items():
-            created_map.setdefault(uid, c)
-
-    # bin -> rank group (by bin centre rank)
-    bin_group = []
-    for b in range(NBIN):
-        bin_group.append(rank_group(max(1, int(round(math.exp((b + 0.5) * BIN_W))))))
-
-    occ = {}  # uid -> [P(place k) averaged over hours], index 1..places
-    for uid, r0 in sorted(close_ranks.items()):
-        v = velocity(snaps, uid, t_end)
-        vb = min(range(len(VEL_BINS)), key=lambda i: abs(VEL_BINS[i] - v))
-        kernel = kernels[vb]
-        c = created_map.get(uid)
-        if c is not None:
-            age0 = (t_end - c).total_seconds() / 86400.0
-        else:
-            age0 = (t_end - first_seen[uid]).total_seconds() / 86400.0
-        # initial distribution: point mass at bin of ln(r0)
-        dist = [0.0] * NSTATES
-        dist[min(NBIN - 1, int(math.log(max(1, r0)) / BIN_W))] = 1.0
-        acc = [0.0] * (places + 1)
-        for step in range(1, n_slots + 1):
-            # diffuse
-            nd = [0.0] * NSTATES
-            for src in range(NBIN):
-                p_src = dist[src]
-                if p_src <= 0.0:
-                    continue
-                for (tgt, p) in kernel[src]:
-                    nd[tgt] += p_src * p
-            nd[OFF] += dist[OFF]
-            # exit hazard (age grows with time)
-            age = age0 + step / 24.0
-            ag = "young" if age < AGE_CUT_DAYS else "old"
-            off_add = 0.0
-            for b in range(NBIN):
-                h = hazard[(bin_group[b], ag)]
-                keep = nd[b] * (1.0 - h)
-                off_add += nd[b] - keep
-                nd[b] = keep
-            nd[OFF] += off_add
-            dist = nd
-            # accumulate occupancy of places 1..10
-            for k in range(1, places + 1):
-                wk = W[k]
-                s = 0.0
-                for b in range(NBIN):
-                    if wk[b]:
-                        s += dist[b] * wk[b]
-                acc[k] += s
-        occ[uid] = [a / n_slots for a in acc]
-
-    # --- allocate probabilities per place ---
-    # Independent per-game diffusions do not enforce one game per place, so
-    # the raw occupancies sum to more (or less) than 1 at a place. Normalise
-    # each place by its raw total, keeping the newcomer share unnamed:
-    #   p(g,k) = q(g,k) * (1 - newcomer[k]) / sum_g q(g,k)
+    # Per-place normalisation with the newcomer reserve.
+    newcomer = params["newcomer"]
     probabilities = []
-    for k in range(1, places + 1):
-        s_k = sum(occ[uid][k] for uid in occ)
-        if s_k <= 0:
+    for k in range(places):
+        raw = {
+            uid: q[k] for uid, (q, _tot) in results.items() if q[k] >= CUTOFF
+        }
+        total = sum(raw.values())
+        if total <= 0:
             continue
-        scale = (1.0 - newcomer.get(k, 0.15)) / s_k
-        cand = sorted(((occ[uid][k] * scale, uid) for uid in occ
-                       if occ[uid][k] * scale >= CUTOFF),
-                      key=lambda x: (-x[0], x[1]))
-        for q, uid in cand[:100]:
-            p = math.floor(q * 1e6) / 1e6
-            if p > 0:
-                probabilities.append({"universe_id": int(uid), "place": k, "p": p})
+        share = 1.0 - newcomer[k]
+        for uid in sorted(raw):
+            p = raw[uid] * share / total
+            if p >= 0.0005:
+                probabilities.append(
+                    {"universe_id": uid, "place": k + 1, "p": round(p, 6)}
+                )
     probabilities.sort(key=lambda r: (r["place"], -r["p"], r["universe_id"]))
 
-    # --- top10 by expected rank (off-top-10 counts as 30) ---
-    def exp_rank(uid):
-        q = occ[uid]
-        s_top = sum(q[1:])
-        return sum(k * q[k] for k in range(1, places + 1)) + 30.0 * (1.0 - s_top)
-    ranked = sorted(occ.keys(), key=lambda u: (exp_rank(u), -sum(occ[u][1:]), u))
-    top10 = [int(u) for u in ranked[:places]]
+    # Top 10: highest total top-10 occupancy, ties by close rank then id.
+    ranked = sorted(
+        results.items(),
+        key=lambda kv: (-kv[1][1], close_rank[kv[0]], kv[0]),
+    )
+    top10 = [uid for uid, _ in ranked[:places]]
+    if len(top10) < places:
+        for r in close_chart:
+            if r["universe_id"] not in top10:
+                top10.append(r["universe_id"])
+            if len(top10) >= places:
+                break
 
     forecast = {"probabilities": probabilities, "top10": top10}
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(os.path.join(OUTPUT_DIR, out_name), "w", encoding="utf-8") as f:
-        f.write(json.dumps(forecast, sort_keys=True) + "\n")
-    # diagnostics to stderr (not into the forecast)
-    n_rows = len(probabilities)
-    sums = {}
-    for k in range(1, places + 1):
-        sums[k] = round(sum(r["p"] for r in probabilities if r["place"] == k), 4)
-    print(f"games={len(occ)} rows={n_rows} beta={beta:.3f} theta={theta:.4f} "
-          f"mu_eq={mu_eq:.2f} (rank {math.exp(mu_eq):.0f}) newcomer={ {k: round(v, 2) for k, v in newcomer.items()} } "
-          f"place_sums={sums} cutoff={CUTOFF}", file=sys.stderr)
+    out_path = os.path.join(OUTPUT_DIR, output_name)
+    with open(out_path, "w") as f:
+        f.write(json.dumps(forecast) + "\n")
+    return forecast
 
 
 if __name__ == "__main__":
