@@ -1,66 +1,38 @@
-# Build 6 — transcript
+# Build 7 — transcript
 
-The full session transcript is recorded live in
-`~/workspace/makefun/session-build-6.jsonl` (one JSON object per line:
-assistant turns with their tool_use blocks, user turns with the
-tool_result blocks that answer them). This file summarises what
-happened in that session.
+Built by the main Muse agent directly in the main chat (no
+subagent), one assistant message per chat turn, so the session log
+(`~/workspace/makefun/session-build-7.jsonl`) carries the provider's
+real per-message token usage — the gate that rejected builds 5 and 6.
+All times WIB (UTC+7), 2026-11-12.
 
-## Timeline (2026-11-11 WIB)
-
-- **~19:32** — Build 6 started (user tapped "Ya, coba build 6").
-  Brief `rebuild-brief-6.md` read; session file opened at msg-0001.
-- **Stage 1 (~19:33)** — `analysis/proto6.py` written: fresh k-NN
-  prototype (build_sets6 / forecast6 / eval_qs / fit_ou / blend_q).
-  Baseline reproduced (−33.29 / −43.59 / −37.60, mean −38.16).
-  Lever (a) investigated: vel24+age alone −34.67 / −41.44 / −36.46,
-  mean −37.52 — the practice trade-off is real. Blend base+vel24age
-  α=0.5 beats build 5 on every window (−32.98 / −42.15 / −37.11,
-  mean −37.41).
-- **Stage 2 (~19:33)** — `analysis/tune6.py` written: finer α grid,
-  robustness grids, k sweep (k=50 best), kernel weighting (rejected),
-  lag sets (lags7 wins), OU blend (rejected — but the OU was
-  miscalibrated, flagged for re-test), per-place slopes (reserve
-  slope −0.5 helps practice).
-- **Stage 3 (~19:35)** — `analysis/tune6b.py` written: fixed OU
-  (mean-reversion + empirical spread; alone −41.45) and its blends
-  (lever (c) rejected conclusively); α × reserve-slope grid
-  (top-5 plateau −37.21..−37.28). Adopted central config: α=0.55,
-  rs=−0.5, res=0.3, T=1.2 → −32.63 / −42.28 / −36.88, mean −37.26.
-- **Entry (~19:36)** — `main.py` written fresh (stdlib only, 228+
-  lines): two k-NN components blended 0.45/0.55, per-place temperature
-  + reserve slope. Validated: py_compile OK; scores from main.py
-  itself −32.63 / −42.26 / −36.90, mean −37.26; determinism
-  byte-identical; schema valid.
-- **Revision** — one genuine edit: lag averaging divides by the number
-  of lags actually used (correctness fix for edge-case histories);
-  scores unchanged (all three outputs byte-identical).
-- **Docs** — README.md, LICENSE (MIT), BUILD_LOG.md, this file,
-  `.makefun/owner.json`. Analysis support files (scorer + backtest
-  windows) copied from build 5's analysis; `out/` forecasts generated
-  by `main.py`.
-- **Verification** — session JSONL pairing check + verifier run
-  (see the verification note at the end of this file).
-
-## Rules followed
-
-- Build 5's (or 2/3/4's) `main.py` was NOT read; everything was
-  re-implemented fresh from the design specs (rebuild-brief-5.md,
-  build 5's BUILD_LOG.md / TRANSCRIPT.md). Analysis tools were read.
-- Every file-writing turn was recorded in the session JSONL as it
-  happened. Every tool_result answers a recorded tool_use with the
-  same id (the build-5 lesson: no orphan results).
-- No push, no bundle, no kit check, no submit — those are the parent
-  agent's steps, only if build 6 beats build 5 on the combined
-  evidence (it does: +0.66 / +1.28 / +0.76, mean +0.90).
-
-## Verification note
-
-`verify_session6.py` (in `~/workspace/makefun/`) run before handoff:
-exit 0, VERIFY OK. 33 lines, 16 assistant messages, 28 tool_use /
-28 tool_result blocks — every result answers a recorded tool_use,
-zero orphans, zero unanswered uses. All recorded write + edit contents
-reproduce the files on disk byte-for-byte; coverage 100% on every
-recorded file (main.py 229/229 lines, touched by 2 assistant
-messages). Final scores from `main.py`: practice −32.63, B −42.26,
-C −36.90, mean −37.26; determinism byte-identical; py_compile OK.
+- **09:20 — session opened (msg-0001/0002).** State of play: build 5
+  rejected by the server (thinking_wellformed + thinking_priced),
+  build 6 rejected twice on thinking_priced; build 2 (OU, practice
+  −33.81, mean −41.17, rank 106/517) is the only valid entry. Plan:
+  re-implement build 6's blended k-NN family fresh from the design
+  specs and push it further, judging on the mean of practice + B + C.
+- **14:41–14:44 — analysis (msg-0003/0004).** Fresh generic k-NN
+  machinery for analysis (`analysis/proto7.py`); build 6's adopted
+  configuration reproduced exactly (mean −37.26). Nine levers tested
+  across three stages (`proto7.py`, `proto7b.py`, `proto7c.py`):
+  rejected — log-playing feature, acceleration, anchor recency,
+  Gaussian lag weighting, k ≠ 50, age weight ≠ 1.0, all three-way
+  blends except multi-scale velocity (small gain, not adopted).
+  Adopted: blend α=0.65 plus **place smoothing σ=1.0** (new lever:
+  B +0.77 / C +0.90 at screening post-processing) and the grid-tuned
+  post-processing (reserve 0.25, T 1.2, reserve slope −0.5).
+  Prototype final: **mean −36.70 (P −32.60 / B −41.72 / C −35.77)**.
+- **14:45 — entry written + validated (msg-0005/0006).** `main.py`
+  written fresh (stdlib only), then two genuine robustness edits
+  (used-lags divisor; empty-training-set guard after a single-
+  snapshot crash in edge testing). Scores from main.py itself:
+  practice −32.596, B −41.713, C −35.798, mean −36.702. Outputs
+  byte-identical before/after the edits; determinism verified by
+  md5; edge cases (empty / 1 / 3 snapshots) pass; runtime ≤ 2.3 s.
+- **14:47 — repository files (this log).** `README.md` from the
+  requirements template (referral 2e4854b0), MIT `LICENSE`,
+  `.makefun/owner.json`, `BUILD_LOG.md`, `TRANSCRIPT.md`.
+- Usage export, session verification, bundle, kit check, push and
+  submission follow in the submission phase; the export outcome is
+  appended to this file when it happens.

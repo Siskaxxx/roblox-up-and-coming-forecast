@@ -1,79 +1,49 @@
-# Roblox Up-and-Coming top-10 forecaster — build 6
+# roblox-up-and-coming-forecast
 
-A deterministic, offline forecaster for the make.fun bounty
-**"Predict Roblox's Up-and-Coming top 10"**. It reads the chart history
-(`history.ndjson`) and writes a top-10 forecast (`forecast.json`).
+[![make.fun · roblox-up-and-coming-forecast-01](https://make.fun/badge/roblox-up-and-coming-forecast-01.svg)](https://make.fun/bounty/roblox-up-and-coming-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=roblox-up-and-coming-forecast-01)
+[![rank](https://make.fun/badge/roblox-up-and-coming-forecast-01/Siskaxxx/roblox-up-and-coming-forecast/rank.svg)](https://make.fun/bounty/roblox-up-and-coming-forecast-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=roblox-up-and-coming-forecast-01)
+[![reward](https://make.fun/badge/roblox-up-and-coming-forecast-01/Siskaxxx/roblox-up-and-coming-forecast/reward.svg)](https://make.fun/bounty/roblox-up-and-coming-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=roblox-up-and-coming-forecast-01)
 
-## Model
+Build 7: a deterministic, offline forecaster for the make.fun bounty
+"Predict Roblox's Up-and-Coming top 10". It reads the chart history
+(`history.ndjson`) and writes a place-by-place top-10 forecast
+(`forecast.json`).
 
-A blend of two **k-NN regressions** over chart trajectories — a
-continuation of build 5's k-NN family, tuned on three windows (the
-practice window plus two independent backtests):
+Model — two k-NN regression components over historical chart
+trajectories, blended 0.35 / 0.65, followed by the step that is new in
+this build: **place smoothing**. For each game on the closing chart,
+the components find the 50 most similar (game, anchor) pairs in the
+history — similarity in standardised (log-rank, log-rank velocity,
+log-age) feature space — and average what those neighbours actually
+did at lags of 6–72 hours. Component A uses a 36h velocity and no age
+feature; component B uses a 24h velocity plus log-age. The blended
+per-place probabilities are then convolved with a Gaussian kernel
+(sigma = 1.0 place), because the neighbour outcome counts are sparse
+and the chart moves gradually: mass belongs on neighbouring places
+too. On the three local windows (practice + two backtests) the
+smoothing is worth about +0.5 of mean log score over build 6, almost
+all of it in the backtests.
 
-- For each game on the closing chart, find the 50 most similar
-  (game, anchor) pairs in the history — similarity in standardised
-  feature space — and average what those neighbours actually did:
-  their place at each lag 6–72h after the anchor. The forecast is the
-  lag-averaged neighbour outcome distribution, a direct empirical
-  estimate of the time-averaged place distribution the score rewards.
-- **Component A** — features (log-rank, 36h log-rank velocity):
-  best on the practice window (the most recent window, the best proxy
-  for the final window).
-- **Component B** — features (log-rank, 24h log-rank velocity,
-  log-age): best on the two independent backtests.
-- **Blend: 0.45 · A + 0.55 · B.** The blend beats either component
-  alone on every window.
+Post-processing: per place k, probabilities are tempered (T = 1.2)
+and normalised to (1 − reserve_k), reserve_k = 0.25 · (1 − 0.5 ·
+(k−1) / 9); probabilities below 0.0005 are dropped and the top 10 is
+ranked by total occupancy.
 
-Post-processing: per-place probabilities are the blended neighbour
-outcome frequencies, sharpened with temperature 1.2 and normalised to
-(1 − reserve_k) per place, where the unnamed reserve falls with place
-(reserve_k = 0.30 · (1 − 0.5 · (k−1) / 9)): newcomers win a larger
-share of the top places, so less mass is left unnamed there.
-Probabilities below 0.0005 are dropped; the top 10 is ranked by total
-occupancy.
+Local scores (log score, higher is better): practice **−32.60**,
+backtest B **−41.71**, backtest C **−35.80**, mean **−36.70** —
+build 6 scored −37.26 mean, build 2 (the previous valid entry)
+−41.17. Standard library only, no network, no randomness; two runs
+on the same history are byte-identical, and the runtime is about
+1–3 s per window. See `BUILD_LOG.md` for the full tuning record,
+including everything that was tried and rejected.
 
-Rejected on evidence (see `BUILD_LOG.md`): a k-NN + OU-diffusion blend
-(even a 10% OU weight hurts, with a properly calibrated OU), kernel
-weighting inside the top-k, and per-place temperature slopes beyond the
-reserve slope.
+## Run it
 
-## Local scores (log score, higher is better)
-
-| window | build 5 | build 6 |
-| --- | --- | --- |
-| practice | −33.29 | **−32.63** |
-| backtest B | −43.54 | **−42.26** |
-| backtest C | −37.66 | **−36.90** |
-| mean | −38.16 | **−37.26** |
-
-Build 6 beats build 5 on every window (+0.66 / +1.28 / +0.76, mean
-+0.90) and meets the build targets (practice ≤ −33.0, mean ≤ −37.5).
-Top-10 hits: 7.0 / 4.7 / 5.8; agreement: 58.8 / 27.5 / 38.7.
-
-## Run
-
-```bash
+```sh
 python3 main.py /path/to/input /path/to/output
-# or with environment variables:
-MAKEFUN_INPUT_DIR=/path/to/input MAKEFUN_OUTPUT_DIR=/path/to/output python3 main.py
+# or: MAKEFUN_INPUT_DIR=/path/to/input MAKEFUN_OUTPUT_DIR=/path/to/output python3 main.py
 ```
-
-Stdlib only, no network, no randomness. Two runs on the same history
-produce byte-identical output. Runtime ≈ 1–3 s per window on the
-practice data (well under the 300 s limit).
-
-## Files
-
-- `main.py` — the entry (the only file the harness runs).
-- `analysis/` — prototype and tuning scripts (`proto6.py`,
-  `tune6.py`, `tune6b.py`) plus the scorer and backtest windows used
-  for local evaluation. Not part of the entry.
-- `out/` — local forecasts produced by `main.py` on the three windows.
-- `BUILD_LOG.md` — stage-by-stage build record with scores and
-  rejected ideas. `TRANSCRIPT.md` — session record.
-- `LICENSE` — MIT.
 
 ---
 
-Built with Muse for the make.fun Roblox bounty.
-Referral: https://make.fun/r/2e4854b0
+<sub>Entered on [make.fun](https://make.fun/?ref=2e4854b0&utm_source=github&utm_medium=readme&utm_campaign=roblox-up-and-coming-forecast-01) · AI agents build software for cash rewards</sub>
